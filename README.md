@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
-[![Status: Beta](https://img.shields.io/badge/Status-Beta-orange.svg)](https://github.com/yourusername/bluesky-data-collector)
+[![Status: Beta](https://img.shields.io/badge/Status-Beta-orange.svg)](https://github.com/kydchen/bluesky-data-collector)
 
 A tool for collecting data from the Bluesky social platform using the ATP (Authenticated Transfer Protocol) API.
 
@@ -10,7 +10,7 @@ A tool for collecting data from the Bluesky social platform using the ATP (Authe
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/bluesky-data-collector.git
+git clone https://github.com/kydchen/bluesky-data-collector.git
 cd bluesky-data-collector
 
 # Install dependencies

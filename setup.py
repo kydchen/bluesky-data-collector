@@ -13,7 +13,7 @@ setup(
     description="A comprehensive tool for collecting data from Bluesky using the ATP API",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/yourusername/bluesky-data-collector",
+    url="https://github.com/kydchen/bluesky-data-collector",
     packages=find_packages(),
     classifiers=[
         "Development Status :: 4 - Beta",
@@ -39,8 +39,8 @@ setup(
     },
     keywords="bluesky, atp, api, data collection, social media, research",
     project_urls={
-        "Bug Reports": "https://github.com/yourusername/bluesky-data-collector/issues",
-        "Source": "https://github.com/yourusername/bluesky-data-collector",
-        "Documentation": "https://github.com/yourusername/bluesky-data-collector#readme",
+        "Bug Reports": "https://github.com/kydchen/bluesky-data-collector/issues",
+        "Source": "https://github.com/kydchen/bluesky-data-collector",
+        "Documentation": "https://github.com/kydchen/bluesky-data-collector#readme",
     },
 ) 

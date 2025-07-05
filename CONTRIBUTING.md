@@ -58,7 +58,7 @@ If you have a suggestion for a new feature or improvement:
 
 ## Development Setup
 
-1. Clone your fork: `git clone https://github.com/yourusername/bluesky-data-collector.git`
+1. Clone your fork: `git clone https://github.com/kydchen/bluesky-data-collector.git`
 2. Create a virtual environment: `python -m venv venv`
 3. Activate the environment: `source venv/bin/activate` (Linux/Mac) or `venv\Scripts\activate` (Windows)
 4. Install dependencies: `pip install -r requirements.txt`

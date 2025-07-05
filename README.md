@@ -4,7 +4,7 @@
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![Status: Beta](https://img.shields.io/badge/Status-Beta-orange.svg)](https://github.com/yourusername/bluesky-data-collector)
 
-A powerful tool for collecting comprehensive data from the Bluesky social platform using the ATP (Authenticated Transfer Protocol) API.
+A tool for collecting data from the Bluesky social platform using the ATP (Authenticated Transfer Protocol) API.
 
 ## 🚀 Quick Start
 

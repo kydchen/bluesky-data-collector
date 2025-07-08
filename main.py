@@ -21,20 +21,25 @@ load_dotenv('config.env')
 sys.path.append(str(Path(__file__).parent / "src"))
 
 from src.client.atp_client import ATPClient
+from src.client.parallel_collector import ParallelCollector
 from src.utils.data_saver import DataSaver
 
 # --- Configuration ---
 # Read from environment variables with defaults
 RATE_LIMIT_DELAY = float(os.getenv('RATE_LIMIT_DELAY', 0.1))
 DATA_DIR = os.getenv('DATA_DIR', 'data')
-SEARCH_DIR = os.path.join(DATA_DIR, "search")
+KEYWORDS_DIR = os.path.join(DATA_DIR, "keywords")  # Renamed from SEARCH_DIR
 USERS_DIR = os.path.join(DATA_DIR, "users")
+USER_PROFILES_DIR = os.path.join(USERS_DIR, "profiles")  # New profiles directory
+USER_POSTS_DIR = os.path.join(USERS_DIR, "posts")  # New posts directory
+FEEDS_DIR = os.path.join(DATA_DIR, "feeds")  # New feeds directory
 DISCOVERED_USERS_PATH = os.path.join(USERS_DIR, "discovered_users.json")
 
 DEFAULT_KEYWORD_LIMIT = int(os.getenv('DEFAULT_KEYWORD_LIMIT', 1000))
-DEFAULT_POPULAR_LIMIT = int(os.getenv('DEFAULT_POPULAR_LIMIT', 500))
-DEFAULT_SUGGESTED_LIMIT = int(os.getenv('DEFAULT_SUGGESTED_LIMIT', 100))
 DEFAULT_USER_POSTS_LIMIT = int(os.getenv('DEFAULT_USER_POSTS_LIMIT', 10000))
+
+# Bluesky public launch date (February 2024)
+BLUESKY_PUBLIC_LAUNCH_DATE = "2024-02-01T00:00:00Z"
 
 # Configure logging
 logging.basicConfig(
@@ -120,15 +125,56 @@ class BlueskyDataCollector:
                                 lang: Optional[str] = None, mentions: Optional[str] = None,
                                 tag: Optional[str] = None, url: Optional[str] = None,
                                 since: Optional[str] = None, until: Optional[str] = None,
-                                sort: Optional[str] = None) -> bool:
-        """Collect posts by keyword with deduplication and user discovery."""
+                                sort: Optional[str] = None, use_default_since: bool = True) -> bool:
+        """Collect posts by keyword with deduplication, user discovery, and batch processing."""
         try:
-            logger.info(f"Collecting posts for keyword: '{keyword}'")
-            posts_data = []
-            cursor = None
-            collected_count = 0
-            post_uris_seen = set()  # Deduplication set
-            topic_participants = {}  # Topic participants
+            # Use default since date if not specified and use_default_since is True
+            if use_default_since and since is None:
+                since = BLUESKY_PUBLIC_LAUNCH_DATE
+                logger.info(f"Using default since date: {since}")
+            
+            logger.info(f"Collecting posts for keyword: '{keyword}' (since: {since}, until: {until})")
+            
+            # File paths - support worker-specific paths for parallel collection
+            if hasattr(self, '_worker_filepaths'):
+                # Use worker-specific paths if provided (for parallel collection)
+                search_filepath = self._worker_filepaths['search_filepath']
+                temp_filepath = self._worker_filepaths['temp_filepath']
+            else:
+                # Use standard paths for single-threaded collection, making them unique
+                # if a time range is provided to avoid conflicts between concurrent runs.
+                filename_suffix = ""
+                # Create a unique suffix from the time range to prevent file collisions
+                # when running multiple single-threaded jobs for the same keyword.
+                if since or until:
+                    # Sanitize since/until for filesystem-friendly names
+                    since_str = since.split('T')[0] if since else "start"
+                    until_str = until.split('T')[0] if until else "end"
+                    filename_suffix = f"_{since_str}_to_{until_str}"
+                    
+                keyword_safe = keyword.replace(' ', '_').replace('.', '_')
+                search_filepath = Path(KEYWORDS_DIR) / f"search_{keyword_safe}{filename_suffix}.json"
+                temp_filepath = Path(KEYWORDS_DIR) / f"search_{keyword_safe}{filename_suffix}_temp.json"
+            
+            # Load existing data for resume functionality
+            existing_data = self._load_existing_search_data(search_filepath, temp_filepath)
+            posts_data = existing_data.get('posts', [])
+            topic_participants = existing_data.get('topic_participants', {})
+            post_uris_seen = set(post.get('uri') for post in posts_data if post.get('uri'))
+            
+            # Convert topic_participants from list to dict for easier handling
+            if isinstance(topic_participants, list):
+                topic_participants = {p['handle']: p for p in topic_participants if p.get('handle')}
+            
+            cursor = existing_data.get('cursor')
+            collected_count = len(posts_data)
+            batch_size = 100  # Save every 100 posts (reduced from 500 for faster progress visibility)
+            last_save_count = collected_count - (collected_count % batch_size)
+            
+            # For incremental batch saving
+            save_batch_participants = {}
+
+            logger.info(f"Resuming collection: {collected_count} posts already collected, cursor: {cursor}")
             
             while limit == 0 or collected_count < limit:
                 batch_limit = min(100, limit - collected_count) if limit > 0 else 100
@@ -140,6 +186,9 @@ class BlueskyDataCollector:
                 )
                 if not search_response or not search_response.get('posts'):
                     break
+                
+                batch_posts = []
+                batch_participants = {}
                 
                 for post_data in search_response['posts']:
                     if not isinstance(post_data, dict) or not post_data.get('uri'):
@@ -156,6 +205,7 @@ class BlueskyDataCollector:
                     processed_post = await self._process_post_view_for_search(post_view, keyword)
                     if processed_post:
                         posts_data.append(processed_post)
+                        batch_posts.append(processed_post)
                         
                         # Collect user information from post author and interactions
                         author_handle = processed_post.get('author_handle')
@@ -166,6 +216,8 @@ class BlueskyDataCollector:
                                     'did': processed_post.get('author_did'),
                                     'displayName': processed_post.get('author_displayName', '')
                                 }
+                                batch_participants[author_handle] = topic_participants[author_handle]
+                                save_batch_participants[author_handle] = topic_participants[author_handle]
                         
                         # Collect users from interactions for topic participants
                         for interaction_type in ['likes', 'reposts']:
@@ -179,36 +231,332 @@ class BlueskyDataCollector:
                                             'did': user_data.get('did'),
                                             'displayName': user_data.get('displayName', '')
                                         }
+                                        batch_participants[handle] = topic_participants[handle]
+                                        save_batch_participants[handle] = topic_participants[handle]
                 
                 collected_count = len(posts_data)
                 cursor = search_response.get('cursor')
+                
+                # Save batch if we've collected enough new posts
+                if collected_count >= last_save_count + batch_size:
+                    if hasattr(self, '_worker_filepaths'):
+                        # Parallel worker saves incremental batches
+                        new_posts_slice = posts_data[last_save_count:collected_count]
+                        await self._save_search_batch(
+                            keyword, new_posts_slice, save_batch_participants, cursor, 
+                            search_filepath, temp_filepath, collected_count, 
+                            last_save_count // batch_size + 1
+                        )
+                        save_batch_participants = {} # Reset for next batch
+                    else:
+                        # Single-threaded saves the entire accumulated data to the temp file
+                        await self._save_search_batch(
+                            keyword, posts_data, topic_participants, cursor, 
+                            search_filepath, temp_filepath, collected_count
+                        )
+                    
+                    last_save_count = collected_count - (collected_count % batch_size)
+                    
+                    # Update discovered users for this batch
+                    if batch_participants:
+                        participant_handles = set(batch_participants.keys())
+                        await self._update_discovered_users(participant_handles, keyword)
+                        logger.info(f"Added {len(participant_handles)} new participants to discovered users")
                 
                 if not cursor:
                     logger.info("No more pages to fetch.")
                     break
                 logger.info(f"Collected {collected_count} unique posts so far for keyword '{keyword}'")
 
-            # Save search results
-            search_filepath = Path(SEARCH_DIR) / f"search_{keyword.replace(' ', '_').replace('.', '_')}.json"
+            # Final save
+            await self._save_search_batch(
+                keyword, posts_data, topic_participants, None, 
+                search_filepath, temp_filepath, collected_count, is_final=True
+            )
             
-            result_data = {
-                "search_metadata": {
-                    "keyword": keyword,
-                    "total_results": len(posts_data),
-                    "recursion_strategy": "original_only",
-                    "collected_at": self._get_current_time()
-                },
-                "posts": posts_data,
-                "topic_participants": list(topic_participants.values())
-            }
+            # Final update of discovered users
+            if topic_participants:
+                participant_handles = set(topic_participants.keys())
+                await self._update_discovered_users(participant_handles, keyword)
+                logger.info(f"Final update: Added {len(participant_handles)} participants to discovered users")
             
-            self.saver.save_json(result_data, search_filepath)
+            # Clean up temp file
+            if temp_filepath.exists():
+                temp_filepath.unlink()
+            
             logger.info(f"Successfully saved {len(posts_data)} posts and {len(topic_participants)} participants for keyword '{keyword}'")
-            
             return True
+            
         except Exception as e:
             logger.error(f"Failed to collect posts for keyword '{keyword}': {e}", exc_info=True)
             return False
+
+    def _load_existing_search_data(self, search_filepath: Path, temp_filepath: Path) -> dict:
+        """Load existing search data for resume functionality."""
+        # Check if this is a parallel worker by checking the temp file name pattern
+        is_parallel_worker = '_worker_' in temp_filepath.stem and temp_filepath.stem.endswith('_temp')
+
+        if is_parallel_worker:
+            worker_stem = temp_filepath.stem.replace('_temp', '')
+            batch_pattern = f"{worker_stem}_batch_*.json"
+            batch_files = sorted(
+                list(temp_filepath.parent.glob(batch_pattern)),
+                key=lambda x: int(x.stem.split('_batch_')[-1])
+            )
+
+            if batch_files:
+                logger.info(f"Found {len(batch_files)} existing batch files for worker. Resuming...")
+                all_posts = []
+                all_participants = {}
+                last_cursor = None
+                for batch_file in batch_files:
+                    try:
+                        with open(batch_file, 'r', encoding='utf-8') as f:
+                            batch_data = json.load(f)
+                        
+                        posts = batch_data.get('posts', [])
+                        all_posts.extend(posts)
+                        
+                        participants = batch_data.get('topic_participants', [])
+                        for p in participants:
+                            if isinstance(p, dict) and p.get('handle') and p['handle'] not in all_participants:
+                                all_participants[p['handle']] = p
+                        
+                        cursor_in_batch = batch_data.get('cursor')
+                        if cursor_in_batch:
+                            last_cursor = cursor_in_batch
+                    except Exception as e:
+                        logger.warning(f"Could not load or process batch file {batch_file}: {e}")
+                
+                logger.info(f"Resumed with {len(all_posts)} posts and {len(all_participants)} participants for worker.")
+                return {
+                    'posts': all_posts,
+                    'topic_participants': all_participants,
+                    'cursor': last_cursor
+                }
+
+        # Original logic for single-threaded or if no batch files are found
+        existing_data = {'posts': [], 'topic_participants': {}, 'cursor': None}
+        
+        # Try to load from temp file first (incomplete session) - for single-threaded
+        if temp_filepath.exists() and not is_parallel_worker:
+            try:
+                with open(temp_filepath, 'r', encoding='utf-8') as f:
+                    temp_data = json.load(f)
+                    existing_data['posts'] = temp_data.get('posts', [])
+                    existing_data['topic_participants'] = temp_data.get('topic_participants', {})
+                    existing_data['cursor'] = temp_data.get('cursor')
+                    logger.info(f"Resumed from temp file: {len(existing_data['posts'])} posts")
+                    return existing_data
+            except Exception as e:
+                logger.warning(f"Failed to load temp file: {e}")
+        
+        # Try to load from final file
+        if search_filepath.exists():
+            try:
+                with open(search_filepath, 'r', encoding='utf-8') as f:
+                    final_data = json.load(f)
+                    existing_data['posts'] = final_data.get('posts', [])
+                    existing_data['topic_participants'] = final_data.get('topic_participants', {})
+                    logger.info(f"Resumed from final file: {len(existing_data['posts'])} posts")
+                    return existing_data
+            except Exception as e:
+                logger.warning(f"Failed to load final file: {e}")
+        
+        return existing_data
+
+    async def _save_search_batch(self, keyword: str, posts_data: list, topic_participants: dict, 
+                                cursor: Optional[str], search_filepath: Path, temp_filepath: Path, 
+                                collected_count: int, batch_number: int = None, is_final: bool = False):
+        """Save search results in batches."""
+        try:
+            # For parallel collection, we need to save individual batches
+            if hasattr(self, '_worker_filepaths'):
+                # This is a parallel collection worker
+                worker_id = self._worker_filepaths.get('worker_id', 0)
+                
+                # If batch_number is not provided, calculate it. This is for the final save.
+                if batch_number is None:
+                    batch_number = (collected_count // 100) + 1 if collected_count > 0 else 1
+                
+                batch_temp_filepath = temp_filepath.parent / f"{temp_filepath.stem}_batch_{batch_number}.json"
+                
+                # For incremental saving, `posts_data` is already the slice of new posts
+                batch_posts = posts_data
+                
+                batch_result = {
+                    "batch_metadata": {
+                        "keyword": keyword,
+                        "batch_number": batch_number,
+                        "worker_id": worker_id,
+                        "posts_in_batch": len(batch_posts),
+                        "collected_at": self._get_current_time(),
+                        "is_final": is_final
+                    },
+                    "posts": batch_posts,
+                    "topic_participants": list(topic_participants.values()),
+                    "cursor": cursor
+                }
+                
+                self.saver.save_json(batch_result, batch_temp_filepath)
+                logger.info(f"Worker {worker_id} Batch {batch_number}: Saved {len(batch_posts)} new posts to {batch_temp_filepath}")
+                
+                # If this is the final save, merge all batches for this worker
+                if is_final:
+                    await self._merge_worker_batches(keyword, search_filepath, temp_filepath, worker_id)
+                
+            else:
+                # Single-threaded collection - always save all accumulated data
+                result_data = {
+                    "search_metadata": {
+                        "keyword": keyword,
+                        "total_results": len(posts_data),
+                        "recursion_strategy": "original_only",
+                        "collected_at": self._get_current_time(),
+                        "batch_saved": True,
+                        "is_final": is_final
+                    },
+                    "posts": posts_data,
+                    "topic_participants": list(topic_participants.values()),
+                    "cursor": cursor
+                }
+                
+                # Save to temp file during collection, final file when complete
+                save_path = search_filepath if is_final else temp_filepath
+                self.saver.save_json(result_data, save_path)
+                
+                if is_final:
+                    logger.info(f"Final save: {len(posts_data)} posts saved to {search_filepath}")
+                else:
+                    logger.info(f"Batch save: {len(posts_data)} posts saved to temp file (cursor: {cursor})")
+                
+        except Exception as e:
+            logger.error(f"Failed to save search batch: {e}")
+            raise
+
+    async def _merge_worker_batches(self, keyword: str, search_filepath: Path, temp_filepath: Path, worker_id: int):
+        """Merge all batch files for a specific worker into a single worker file"""
+        try:
+            # Find all batch files for this worker
+            batch_pattern = f"{temp_filepath.stem}_batch_*.json"
+            batch_files = sorted(
+                list(temp_filepath.parent.glob(batch_pattern)),
+                key=lambda x: int(x.stem.split('_batch_')[-1])
+            )
+            
+            if not batch_files:
+                logger.warning(f"No batch files found for worker {worker_id}")
+                return
+            
+            all_posts = []
+            all_participants = {}
+
+            logger.info(f"Merging {len(batch_files)} batch files for worker {worker_id}...")
+
+            for batch_file in batch_files:
+                try:
+                    with open(batch_file, 'r', encoding='utf-8') as f:
+                        batch_data = json.load(f)
+                    
+                    all_posts.extend(batch_data.get('posts', []))
+                    
+                    participants_slice = batch_data.get('topic_participants', [])
+                    for p in participants_slice:
+                        if isinstance(p, dict) and p.get('handle') and p['handle'] not in all_participants:
+                            all_participants[p['handle']] = p
+
+                except Exception as e:
+                    logger.error(f"Error processing batch file {batch_file} for merging: {e}")
+
+            # Clean up all batch files
+            for batch_file in batch_files:
+                try:
+                    batch_file.unlink()
+                    logger.info(f"Cleaned up batch file: {batch_file}")
+                except Exception as e:
+                    logger.error(f"Failed to clean up batch file {batch_file}: {e}")
+
+            # Create final worker file
+            worker_result = {
+                "search_metadata": {
+                    "keyword": keyword,
+                    "total_results": len(all_posts),
+                    "recursion_strategy": "original_only",
+                    "collected_at": self._get_current_time(),
+                    "worker_id": worker_id,
+                    "batches_processed": len(batch_files),
+                    "is_worker_final": True
+                },
+                "posts": all_posts,
+                "topic_participants": list(all_participants.values())
+            }
+            
+            # Save worker file
+            self.saver.save_json(worker_result, search_filepath)
+            logger.info(f"Worker {worker_id}: Created final file with {len(all_posts)} posts from {len(batch_files)} batches")
+            
+        except Exception as e:
+            logger.error(f"Error merging worker batches for worker {worker_id}: {e}")
+            raise
+
+    async def _merge_user_worker_batches(self, handle: str, user_filepath: Path, temp_filepath: Path, worker_id: int):
+        """Merge all batch files for a specific user posts worker into a single worker file"""
+        try:
+            # Find all batch files for this worker
+            batch_pattern = f"{temp_filepath.stem}_batch_*.json"
+            batch_files = sorted(
+                list(temp_filepath.parent.glob(batch_pattern)),
+                key=lambda x: int(x.stem.split('_batch_')[-1])
+            )
+            
+            if not batch_files:
+                logger.warning(f"No batch files found for user worker {worker_id}")
+                return
+            
+            all_posts = []
+            logger.info(f"Merging {len(batch_files)} batch files for user worker {worker_id}...")
+
+            for batch_file in batch_files:
+                try:
+                    with open(batch_file, 'r', encoding='utf-8') as f:
+                        batch_data = json.load(f)
+                    all_posts.extend(batch_data.get('posts', []))
+                except Exception as e:
+                    logger.error(f"Error processing batch file {batch_file} for merging: {e}")
+
+            # Clean up all batch files
+            for batch_file in batch_files:
+                try:
+                    batch_file.unlink()
+                    logger.info(f"Cleaned up user batch file: {batch_file}")
+                except Exception as e:
+                    logger.error(f"Failed to clean up user batch file {batch_file}: {e}")
+            
+            # Create final worker file
+            worker_result = {
+                "user_metadata": {
+                    "handle": handle,
+                    "total_results": len(all_posts),
+                    "collected_at": self._get_current_time(),
+                    "worker_id": worker_id,
+                    "batches_processed": len(batch_files),
+                    "is_worker_final": True
+                },
+                "posts": all_posts
+            }
+            
+            # Save worker file
+            self.saver.save_json(worker_result, user_filepath)
+            logger.info(f"User Worker {worker_id}: Created final file with {len(all_posts)} posts from {len(batch_files)} batches")
+            
+        except Exception as e:
+            logger.error(f"Error merging user worker batches for worker {worker_id}: {e}")
+            raise
+
+    def _get_current_time(self) -> str:
+        """Get current time in ISO format."""
+        from datetime import datetime
+        return datetime.now().isoformat()
 
     async def _process_post_view_for_search(self, post_view: dict, keyword: str) -> Optional[dict]:
         """Process a single post for keyword search with original-only recursion strategy."""
@@ -221,15 +569,6 @@ class BlueskyDataCollector:
         processed_post['search_keyword'] = keyword
         return processed_post
 
-    def _get_current_time(self) -> str:
-        """Get current time in ISO format."""
-        from datetime import datetime
-        return datetime.now().isoformat()
-
-    def collect_popular_content(self, limit: int = 500) -> bool:
-        logger.warning("collect_popular_content is a placeholder.")
-        return True
-
     async def collect_user_profile(self, handle: str) -> bool:
         """Collect and save a single user's profile."""
         try:
@@ -239,53 +578,110 @@ class BlueskyDataCollector:
                 logger.error(f"Profile not found or failed to fetch for user {handle}")
                 return False
 
-            user_filepath = Path(USERS_DIR) / f"{handle.replace('.', '_')}_profile.json"
+            user_filepath = Path(USER_PROFILES_DIR) / f"{handle.replace('.', '_')}_profile.json"
             self.saver.save_json(profile, user_filepath)
             return True
         except Exception as e:
             logger.error(f"Failed to collect profile for user {handle}: {e}")
             return False
     
-    async def collect_user_posts(self, handle: str, limit: int = 10000) -> bool:
-        """Collect user posts and their full, recursive interaction trees."""
+    async def collect_user_posts(self, handle: str, limit: int = 10000, 
+                                since: Optional[str] = None, until: Optional[str] = None, 
+                                use_default_since: bool = True) -> bool:
+        """Collect user posts and their full, recursive interaction trees with batch processing."""
         try:
-            logger.info(f"Collecting posts for user: {handle}")
-            posts_data = []
-            cursor = None
-            collected_count = 0
+            # Use default since date if not specified and use_default_since is True
+            if use_default_since and since is None:
+                since = BLUESKY_PUBLIC_LAUNCH_DATE
+                logger.info(f"Using default since date: {since}")
+            
+            logger.info(f"Collecting posts for user: {handle} (since: {since}, until: {until})")
+            
+            # File paths - support worker-specific paths for parallel collection
+            if hasattr(self, '_worker_filepaths'):
+                 # Use worker-specific paths if provided (for parallel collection)
+                user_filepath = self._worker_filepaths['search_filepath'] # Reusing key from keyword search
+                temp_filepath = self._worker_filepaths['temp_filepath'] # Reusing key from keyword search
+            else:
+                # Add time range to filename to avoid conflicts in concurrent runs
+                filename_suffix = ""
+                if since or until:
+                    since_str = since.split('T')[0] if since else "start"
+                    until_str = until.split('T')[0] if until else "end"
+                    filename_suffix = f"_{since_str}_to_{until_str}"
+                    
+                handle_safe = handle.replace('.', '_')
+                user_filepath = Path(USER_POSTS_DIR) / f"{handle_safe}{filename_suffix}_posts.json"
+                temp_filepath = Path(USER_POSTS_DIR) / f"{handle_safe}{filename_suffix}_posts_temp.json"
+            
+            # Load existing data for resume functionality
+            existing_data = self._load_existing_user_data(user_filepath, temp_filepath)
+            posts_data = existing_data.get('posts', [])
+            cursor = existing_data.get('cursor')
+            collected_count = len(posts_data)
+            batch_size = 100  # Save every 100 posts (reduced from 500 for faster progress visibility)
+            last_save_count = collected_count - (collected_count % batch_size)
+            
+            logger.info(f"Resuming user collection: {collected_count} posts already collected, cursor: {cursor}")
             
             while limit == 0 or collected_count < limit:
                 batch_limit = min(100, limit - collected_count) if limit > 0 else 100
                 await asyncio.sleep(self.rate_limit_delay)
-                feed = self.client.get_user_feed(handle, batch_limit, cursor)
+                feed = self.client.get_user_feed(handle, batch_limit, cursor, since, until)
                 if not feed or not feed.get('feed'):
                     break
                 
+                batch_posts = []
                 for post_view in feed['feed']:
                     post_data = await self._process_post_view(post_view, handle)
                     if post_data: # Filter out malformed posts
                         posts_data.append(post_data)
+                        batch_posts.append(post_data)
 
-                collected_count += len(feed['feed'])
+                collected_count = len(posts_data)
                 cursor = feed.get('cursor')
+                
+                # Save batch if we've collected enough new posts
+                if collected_count >= last_save_count + batch_size:
+                    if hasattr(self, '_worker_filepaths'):
+                        # Parallel worker saves incremental batches
+                        new_posts_slice = posts_data[last_save_count:collected_count]
+                        await self._save_user_batch(
+                            handle, new_posts_slice, cursor, user_filepath, temp_filepath, 
+                            collected_count, last_save_count // batch_size + 1
+                        )
+                    else:
+                        # Single-threaded saves the entire accumulated data to the temp file
+                        await self._save_user_batch(
+                            handle, posts_data, cursor, user_filepath, temp_filepath, 
+                            collected_count
+                        )
+                    last_save_count = collected_count - (collected_count % batch_size)
                 
                 if not cursor:
                     logger.info("No more pages to fetch.")
                     break
                 logger.info(f"Collected {collected_count} posts so far for user {handle}")
 
-            user_filepath = Path(USERS_DIR) / f"{handle.replace('.', '_')}_posts.json"
-            self.saver.save_json(posts_data, user_filepath)
+            # Final save
+            await self._save_user_batch(
+                handle, posts_data, None, user_filepath, temp_filepath, collected_count, is_final=True
+            )
             
+            # Extract and update discovered users
             all_handles = self._extract_all_handles(posts_data, primary_handle=handle)
             await self._update_discovered_users(all_handles)
+            
+            # Clean up temp file
+            if temp_filepath.exists():
+                temp_filepath.unlink()
             
             return True
         except Exception as e:
             logger.error(f"Failed to collect posts for user {handle}: {e}", exc_info=True)
             return False
 
-    async def _process_post_view(self, post_view: dict, current_user_handle: str = None) -> Optional[dict]:
+    async def _process_post_view(self, post_view: dict, current_user_handle: str = None, *, recursion_seen_uris: Optional[set] = None) -> Optional[dict]:
         """Process a single post/reply/quote to extract its full, recursive interaction tree."""
         # Check if post_view is None or not a dict
         if not isinstance(post_view, dict):
@@ -300,6 +696,16 @@ class BlueskyDataCollector:
         author = post.get('author', {})
         record = post.get('record', {})
         uri, cid = post['uri'], post['cid']
+        
+        # Avoid infinite loops during recursion by tracking seen URIs
+        if recursion_seen_uris and uri in recursion_seen_uris:
+            logger.info(f"Skipping post {uri} to avoid recursive cycle.")
+            return None
+        
+        # Initialize or copy the set for the current recursion path
+        current_seen_uris = recursion_seen_uris.copy() if recursion_seen_uris else set()
+        current_seen_uris.add(uri)
+        
         post_author_handle = author.get('handle')
         
         # Extract relationship data - this reflects how the current user interacted with this post
@@ -310,48 +716,49 @@ class BlueskyDataCollector:
                                      current_user_handle and 
                                      post_author_handle == current_user_handle)
         
-        # Determine if we should get full interaction tree
-        # Get full interaction tree if:
-        # 1. This is an original post by the current user (not a repost, quote, or reply by current user)
-        # 2. OR this is a reply/quote to an original post by the current user (recursive collection)
-        # 3. OR this is a recursive collection (quotes/replies that should get full interactions)
-        # 4. OR this is a keyword search and the post is original (not reply/quote/repost)
-        should_get_full_interactions = (is_original_by_current_user or 
-                                      (current_user_handle and 
-                                       (is_reply or is_quote) and 
-                                       post_author_handle != current_user_handle) or
-                                      current_user_handle == "RECURSIVE_COLLECTION" or
-                                      (current_user_handle == "KEYWORD_SEARCH" and 
-                                       not (is_reply or is_quote or is_repost)))
+        # Determine the data collection strategy based on the context
+        should_get_full_interactions = False
+        should_get_basic_interactions = False
         
-        # For keyword search, we want to collect users from interactions but not get full recursive data
-        # So we modify the logic to get basic interaction data for keyword search
-        if current_user_handle == "KEYWORD_SEARCH":
-            # For keyword search, get basic interaction data (counts and user lists) but not recursive replies/quotes
-            should_get_full_interactions = False
-            # Only get basic interactions for original posts (not replies/quotes/reposts)
-            should_get_basic_interactions = not (is_reply or is_quote or is_repost)
-            # For keyword search, original posts should get full recursive data (replies and quotes)
-            should_get_recursive_for_original = not (is_reply or is_quote or is_repost)
-        else:
-            should_get_basic_interactions = False
-            should_get_recursive_for_original = False
+        is_original_post = not (is_reply or is_quote or is_repost)
+
+        if current_user_handle == "RECURSIVE_COLLECTION":
+            # This is a recursive call for a reply/quote. Get its full interaction tree.
+            # Cycle detection is handled by the `recursion_seen_uris` parameter.
+            should_get_full_interactions = True
+        
+        elif current_user_handle == "KEYWORD_SEARCH" or current_user_handle == "FEED_COLLECTION":
+            # For keyword/feed search, apply the "original_only" strategy.
+            if is_original_post:
+                # Original posts get the full recursive treatment.
+                should_get_full_interactions = True
+            else:
+                # Replies/quotes/reposts found in search results only get basic data (user lists for discovery).
+                # But they should NOT trigger recursive collection of their own replies/quotes.
+                should_get_basic_interactions = True
+
+        elif current_user_handle: # This implies it's a specific user's feed collection
+            if is_original_by_current_user:
+                 # An original post by the user whose feed we are collecting gets the full treatment.
+                should_get_full_interactions = True
+            # For all other posts in a user's feed (replies, quotes, reposts), we only get counts,
+            # so both flags remain False, and the code will fall through to the final `else` block.
         
         if should_get_full_interactions:
-            # Get full interaction tree for user's own original posts
-            # This includes recursive collection of all interactions
+            # Get full interaction tree for user's own original posts or recursive calls
             
             # Likes and Reposts: Get all users who liked/reposted (no recursion needed)
             likes_data = await self._get_interaction_data(self.client.get_post_likes, uri, cid, 'likes')
             reposts_data = await self._get_interaction_data(self.client.get_post_reposts, uri, cid, 'reposted_by')
             
             # Quotes: Get all quotes with their full interaction trees (recursive)
-            quotes_data = await self._get_quotes_recursively(uri, cid)  # Already recursive
+            quotes_data = await self._get_quotes_recursively(uri, cid, recursion_seen_uris=current_seen_uris)
             
             # Replies: Get all replies with their full interaction trees (recursive)
-            replies_data = await self._get_replies(uri)  # Already recursive
+            replies_data = await self._get_replies(uri, recursion_seen_uris=current_seen_uris)
+        
         elif should_get_basic_interactions:
-            # For keyword search, get basic interaction data (user lists) but not recursive replies/quotes
+            # For non-original posts in keyword/feed searches, get basic interaction data (user lists and counts)
             try:
                 await asyncio.sleep(self.rate_limit_delay)
                 # Get basic interaction data for user discovery
@@ -359,34 +766,34 @@ class BlueskyDataCollector:
                 reposts_response = self.client.get_post_reposts(uri=uri, cid=cid, limit=100)
                 quotes_response = self.client.get_post_quotes(uri=uri, cid=cid, limit=100)
                 
-                # Process user data for likes and reposts
-                likes_data = []
-                reposts_data = []
+                # For non-original posts in searches, we only collect user handles for discovery
+                # but we DON'T store detailed user information in the likes/reposts arrays
+                discovered_users = set()
+                
                 if likes_response and likes_response.get('likes'):
                     for like_data in likes_response['likes']:
-                        processed_like = self._process_user_data(like_data, 'likes')
-                        if processed_like:
-                            likes_data.append(processed_like)
+                        if isinstance(like_data, dict) and like_data.get('actor', {}).get('handle'):
+                            discovered_users.add(like_data['actor']['handle'])
                 
                 if reposts_response and reposts_response.get('reposted_by'):
                     for repost_data in reposts_response['reposted_by']:
-                        processed_repost = self._process_user_data(repost_data, 'reposted_by')
-                        if processed_repost:
-                            reposts_data.append(processed_repost)
+                        if isinstance(repost_data, dict) and repost_data.get('actor', {}).get('handle'):
+                            discovered_users.add(repost_data['actor']['handle'])
                 
-                # For keyword search, original posts should get recursive quotes/replies
-                if should_get_recursive_for_original:
-                    # Get recursive quotes and replies for original posts
-                    quotes_data = await self._get_quotes_recursively(uri, cid)
-                    replies_data = await self._get_replies(uri)
-                else:
-                    # For non-original posts, don't get recursive data
-                    quotes_data = []
-                    replies_data = []
+                # Store discovered users for later batch processing, but don't include detailed user data
+                # in the post's likes/reposts arrays
+                if discovered_users:
+                    await self._update_discovered_users(discovered_users)
                 
-                # Get counts
-                likes_count = len(likes_data)
-                reposts_count = len(reposts_data)
+                # For non-original posts in searches, we NEVER store detailed interaction data
+                likes_data = []
+                reposts_data = []
+                quotes_data = []
+                replies_data = []
+                
+                # Get counts only
+                likes_count = len(likes_response.get('likes', [])) if likes_response else 0
+                reposts_count = len(reposts_response.get('reposted_by', [])) if reposts_response else 0
                 quotes_count = len(quotes_response.get('posts', [])) if quotes_response else 0
                 
                 # Get reply count from thread (but not the actual replies)
@@ -472,6 +879,7 @@ class BlueskyDataCollector:
         return {
             'uri': uri, 'cid': cid,
             'author_did': author.get('did'), 'author_handle': author.get('handle'),
+            'author_displayName': author.get('displayName', author.get('display_name', '')),  # Try both field names
             'text': record.get('text', ''),
             # 'rich_media': rich_media,  # Removed for simplicity
             'url': self._generate_post_url(author.get('handle'), uri),
@@ -488,6 +896,7 @@ class BlueskyDataCollector:
             'quoted_post_info': quoted_post_info,  # Add quoted post details
             'likes': likes_data, 'reposts': reposts_data,
             'replies': replies_data, 'quotes': quotes_data,
+            'interaction_type': current_user_handle
         }
 
     def _extract_rich_media(self, record: dict, post: dict) -> dict:
@@ -561,9 +970,6 @@ class BlueskyDataCollector:
         is_repost, is_quote, is_reply = False, False, False
         original_post_uri, original_post_author, parent_uri, root_uri = None, None, None, None
 
-        # Debug logging
-        logger.info(f"Entering _extract_post_relations with post_view type: {type(post_view)}")
-        
         # Check if post_view is None or not a dict
         if not isinstance(post_view, dict):
             logger.warning(f"post_view is not a dict: {type(post_view)} - {post_view}")
@@ -576,9 +982,7 @@ class BlueskyDataCollector:
 
         # Check for repost first (reason field in post_view)
         reason = post_view.get('reason')
-        logger.info(f"Reason field: {reason}")
         if reason and isinstance(reason, dict):
-            logger.info(f"Reason type: {reason.get('py_type')}")
             if reason.get('py_type') == 'app.bsky.feed.defs#reasonRepost':
                 is_repost = True
                 # For reposts, the original post is the one being reposted
@@ -586,14 +990,12 @@ class BlueskyDataCollector:
                 post_in_view = post_view.get('post', {})
                 original_post_uri = post_in_view.get('uri')
                 original_post_author = post_in_view.get('author', {}).get('handle')
-                logger.info(f"Detected repost: {original_post_uri} by {original_post_author}")
                 # Don't check for quote if this is already a repost
                 # The user's action is repost, not quote
                 return is_repost, is_quote, is_reply, original_post_uri, original_post_author, parent_uri, root_uri
         
         # Check for quote (embed field in record) - only if not a repost
         embed = record.get('embed', {})
-        logger.info(f"Embed field: {embed}")
         if isinstance(embed, dict):
             # Check for simple quote (app.bsky.embed.record)
             if embed.get('py_type') == 'app.bsky.embed.record':
@@ -601,7 +1003,6 @@ class BlueskyDataCollector:
                 record_embed = embed.get('record', {})
                 original_post_uri = record_embed.get('uri')
                 original_post_author = record_embed.get('author', {}).get('handle')
-                logger.info(f"Detected quote: {original_post_uri} by {original_post_author}")
                 
                 # If we don't have author info, try to fetch the original post
                 if not original_post_author and original_post_uri:
@@ -637,7 +1038,6 @@ class BlueskyDataCollector:
                             if post_info and post_info.get('posts'):
                                 original_post = post_info['posts'][0]
                                 original_post_author = original_post.get('author', {}).get('handle')
-                                logger.info(f"Detected quote with media: {original_post_uri} by {original_post_author}")
                                 # Store additional info about the quoted post
                                 self._quoted_posts_cache[original_post_uri] = {
                                     'author_handle': original_post_author,
@@ -651,15 +1051,12 @@ class BlueskyDataCollector:
         
         # Check for reply (reply field in record)
         reply_field = record.get('reply')
-        logger.info(f"Reply field: {reply_field}")
         if isinstance(record, dict) and reply_field:
             is_reply = True
             reply_ref = record.get('reply', {})
             parent_uri = reply_ref.get('parent', {}).get('uri')
             root_uri = reply_ref.get('root', {}).get('uri')
-            logger.info(f"Detected reply: parent={parent_uri}, root={root_uri}")
 
-        logger.info(f"Final result: is_repost={is_repost}, is_quote={is_quote}, is_reply={is_reply}")
         return is_repost, is_quote, is_reply, original_post_uri, original_post_author, parent_uri, root_uri
 
     async def _get_interaction_data(self, api_method: Callable, uri: str, cid: str, data_key: str, processor: Optional[Callable] = None) -> list:
@@ -720,7 +1117,7 @@ class BlueskyDataCollector:
                 'interaction_type': interaction_type
             }
 
-    async def _get_quotes_recursively(self, uri: str, cid: str) -> list:
+    async def _get_quotes_recursively(self, uri: str, cid: str, *, recursion_seen_uris: Optional[set] = None) -> list:
         """Get all quotes for a post and process them recursively with full interaction trees."""
         quotes = []
         cursor = None
@@ -738,7 +1135,7 @@ class BlueskyDataCollector:
                         post_view = {'post': post_data}
                         # Process quote with full interaction tree (recursive)
                         # Pass a special flag to indicate this is a quote/reply that should get full interactions
-                        processed_quote = await self._process_post_view(post_view, "RECURSIVE_COLLECTION")
+                        processed_quote = await self._process_post_view(post_view, "RECURSIVE_COLLECTION", recursion_seen_uris=recursion_seen_uris)
                         if processed_quote:
                             quotes.append(processed_quote)
                 
@@ -750,19 +1147,19 @@ class BlueskyDataCollector:
                 break
         return quotes
 
-    async def _get_replies(self, uri: str) -> list:
+    async def _get_replies(self, uri: str, *, recursion_seen_uris: Optional[set] = None) -> list:
         """Get all replies for a given post uri by fetching the thread with full interaction trees."""
         if not uri: return []
         try:
             await asyncio.sleep(self.rate_limit_delay)
             thread = self.client.get_post_thread(uri, depth=10)
             if thread and isinstance(thread, dict) and thread.get('thread'):
-                return await self._extract_replies_from_thread(thread['thread'])
+                return await self._extract_replies_from_thread(thread['thread'], recursion_seen_uris=recursion_seen_uris)
         except Exception as e:
             logger.warning(f"Failed to get reply thread for {uri}: {e}")
         return []
 
-    async def _extract_replies_from_thread(self, thread_data: dict) -> list:
+    async def _extract_replies_from_thread(self, thread_data: dict, *, recursion_seen_uris: Optional[set] = None) -> list:
         """Recursively extract replies from a thread structure with full interaction trees."""
         replies = []
         if isinstance(thread_data, dict) and 'replies' in thread_data:
@@ -770,19 +1167,117 @@ class BlueskyDataCollector:
                 if isinstance(reply_view, dict) and 'post' in reply_view:
                     # Process reply with full interaction tree (recursive)
                     # Pass a special flag to indicate this is a quote/reply that should get full interactions
-                    reply_data = await self._process_post_view(reply_view, "RECURSIVE_COLLECTION")
+                    reply_data = await self._process_post_view(reply_view, "RECURSIVE_COLLECTION", recursion_seen_uris=recursion_seen_uris)
                     if reply_data: 
                         replies.append(reply_data)
         return replies
 
-    def collect_suggested_users(self, limit: int = 100) -> bool:
-        logger.warning("collect_suggested_users is a placeholder.")
-        return True
-
-    async def _update_discovered_users(self, discovered_users: set):
+    async def _update_discovered_users(self, discovered_users: set, keyword: Optional[str] = None):
+        """Update discovered users with thread-safe file handling and atomic operations."""
         if not discovered_users:
             return
-        self.saver.save_discovered_users(discovered_users, Path(DISCOVERED_USERS_PATH))
+        
+        # Always update the global discovered_users.json
+        # Use asyncio.to_thread to handle file I/O in a thread pool
+        # This prevents blocking the event loop and provides better concurrency handling
+        await asyncio.to_thread(self._atomic_update_discovered_users, discovered_users, Path(DISCOVERED_USERS_PATH))
+        
+        # Also update keyword-specific discovered_users file if keyword is provided
+        if keyword:
+            keyword_file_path = Path(USERS_DIR) / f"discovered_users_{keyword}.json"
+            await asyncio.to_thread(self._atomic_update_discovered_users, discovered_users, keyword_file_path)
+
+    def _safe_read_discovered_users(self) -> Optional[List[str]]:
+        """Safely read discovered users file with file locking."""
+        import fcntl
+        
+        filepath = Path(DISCOVERED_USERS_PATH)
+        if not filepath.exists():
+            return None
+        
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                # Acquire shared lock for reading
+                fcntl.flock(f.fileno(), fcntl.LOCK_SH)
+                try:
+                    content = f.read()
+                    if content:
+                        return json.loads(content)
+                    return []
+                finally:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        except (IOError, json.JSONDecodeError) as e:
+            logger.warning(f"Could not read or parse discovered users file at {filepath}: {e}")
+            return None
+
+    def _atomic_update_discovered_users(self, new_users: set, filepath: Path):
+        """Atomically update discovered users file with file locking."""
+        import fcntl
+        import tempfile
+        import shutil
+        
+        if not new_users:
+            return
+
+        # Create a temporary file for atomic write
+        temp_filepath = filepath.with_suffix('.tmp')
+        
+        try:
+            # Read existing users
+            existing_users: set = set()
+            if filepath.exists():
+                try:
+                    with open(filepath, 'r', encoding='utf-8') as f:
+                        # Acquire shared lock for reading
+                        fcntl.flock(f.fileno(), fcntl.LOCK_SH)
+                        try:
+                            content = f.read()
+                            if content:
+                                existing_users.update(json.loads(content))
+                        finally:
+                            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                except (IOError, json.JSONDecodeError) as e:
+                    logger.warning(f"Could not read or parse existing discovered users file at {filepath}: {e}. Starting fresh.")
+            
+            # Calculate new users
+            new_users_to_add = new_users - existing_users
+            if not new_users_to_add:
+                logger.info(f"No new users to add to the discovered list. Total remains {len(existing_users)}.")
+                return
+
+            updated_users = existing_users.union(new_users)
+            
+            # Write to temporary file first
+            try:
+                temp_filepath.parent.mkdir(parents=True, exist_ok=True)
+                with open(temp_filepath, 'w', encoding='utf-8') as f:
+                    # Acquire exclusive lock for writing
+                    fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                    try:
+                        json.dump(sorted(list(updated_users)), f, ensure_ascii=False, indent=2)
+                        f.flush()  # Ensure data is written to disk
+                        os.fsync(f.fileno())  # Force sync to disk
+                    finally:
+                        fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                
+                # Atomic move: rename temp file to target file
+                # This is atomic on most filesystems
+                shutil.move(str(temp_filepath), str(filepath))
+                
+                logger.info(f"Updated discovered users file with {len(new_users_to_add)} new users. Total: {len(updated_users)}")
+                
+            except Exception as e:
+                # Clean up temp file if something went wrong
+                if temp_filepath.exists():
+                    temp_filepath.unlink()
+                raise e
+                
+        except Exception as e:
+            logger.error(f"Error saving discovered users to {filepath}: {e}")
+            # Clean up temp file if it exists
+            if temp_filepath.exists():
+                temp_filepath.unlink()
+            raise
 
     def _extract_all_handles(self, data: Any, primary_handle: Optional[str] = None) -> set:
         """Recursively extracts all user handles from collected data."""
@@ -798,6 +1293,494 @@ class BlueskyDataCollector:
                 handles.update(self._extract_all_handles(item, primary_handle))
         return handles
 
+    # --- Feed Discovery and Collection Methods ---
+    
+    async def collect_suggested_feeds(self, limit: int = 100) -> bool:
+        """Collect suggested feeds for discovery"""
+        try:
+            logger.info(f"Collecting suggested feeds (limit: {limit})")
+            
+            # Use the new method to get all available feeds
+            response = self.client.get_all_suggested_feeds(limit)
+            if not response or not response.get('feeds'):
+                logger.error("Failed to get suggested feeds")
+                return False
+            
+            feeds_data = response['feeds']
+            api_calls_made = response.get('api_calls_made', 0)
+            
+            logger.info(f"Made {api_calls_made} API calls to collect feeds")
+
+            # Save suggested feeds
+            feeds_filepath = Path(FEEDS_DIR) / "suggested_feeds.json"
+            self.saver.save_json(feeds_data, feeds_filepath)
+            logger.info(f"Successfully saved {len(feeds_data)} suggested feeds")
+            
+            return True
+        except Exception as e:
+            logger.error(f"Failed to collect suggested feeds: {e}", exc_info=True)
+            return False
+    
+    async def collect_feed_content(self, feed_uri: str, limit: int = 1000) -> bool:
+        """Collect content from a specific feed with batch processing"""
+        try:
+            logger.info(f"Collecting content from feed: {feed_uri}")
+            
+            # File paths
+            feed_name = feed_uri.replace('at://', '').replace('/', '_').replace('.', '_')
+            feed_filepath = Path(FEEDS_DIR) / f"feed_{feed_name}.json"
+            temp_filepath = Path(FEEDS_DIR) / f"feed_{feed_name}_temp.json"
+            
+            # Load existing data for resume functionality
+            existing_data = self._load_existing_feed_data(feed_filepath, temp_filepath)
+            posts_data = existing_data.get('posts', [])
+            feed_participants = existing_data.get('feed_participants', {})
+            post_uris_seen = set(post.get('uri') for post in posts_data if post.get('uri'))
+            
+            # Convert feed_participants from list to dict for easier handling
+            if isinstance(feed_participants, list):
+                feed_participants = {p['handle']: p for p in feed_participants if p.get('handle')}
+            
+            cursor = existing_data.get('cursor')
+            collected_count = len(posts_data)
+            batch_size = 100  # Save every 100 posts (reduced from 500 for faster progress visibility)
+            last_save_count = collected_count - (collected_count % batch_size)
+            
+            logger.info(f"Resuming feed collection: {collected_count} posts already collected, cursor: {cursor}")
+            
+            while limit == 0 or collected_count < limit:
+                batch_limit = min(100, limit - collected_count) if limit > 0 else 100
+                await asyncio.sleep(self.rate_limit_delay)
+                
+                feed_response = self.client.get_feed(feed_uri, batch_limit, cursor)
+                if not feed_response or not feed_response.get('feed'):
+                    break
+                
+                batch_posts = []
+                batch_participants = {}
+                
+                for post_view in feed_response['feed']:
+                    if not isinstance(post_view, dict) or not post_view.get('post'):
+                        continue
+                    
+                    post_uri = post_view['post'].get('uri')
+                    if not post_uri or post_uri in post_uris_seen:
+                        continue  # Skip duplicate posts
+                    
+                    post_uris_seen.add(post_uri)
+                    
+                    # Process post with feed context
+                    processed_post = await self._process_post_view_for_feed(post_view, feed_uri)
+                    if processed_post:
+                        posts_data.append(processed_post)
+                        batch_posts.append(processed_post)
+                        
+                        # Collect user information from post author and interactions
+                        author_handle = processed_post.get('author_handle')
+                        if author_handle:
+                            if author_handle not in feed_participants:
+                                feed_participants[author_handle] = {
+                                    'handle': author_handle,
+                                    'did': processed_post.get('author_did'),
+                                    'displayName': processed_post.get('author_displayName', '')
+                                }
+                                batch_participants[author_handle] = feed_participants[author_handle]
+                        
+                        # Collect users from interactions for feed participants
+                        for interaction_type in ['likes', 'reposts']:
+                            interaction_data = processed_post.get(interaction_type, [])
+                            for user_data in interaction_data:
+                                if isinstance(user_data, dict) and user_data.get('handle'):
+                                    handle = user_data['handle']
+                                    if handle not in feed_participants:
+                                        feed_participants[handle] = {
+                                            'handle': handle,
+                                            'did': user_data.get('did'),
+                                            'displayName': user_data.get('displayName', '')
+                                        }
+                                        batch_participants[handle] = feed_participants[handle]
+                
+                collected_count = len(posts_data)
+                cursor = feed_response.get('cursor')
+                
+                # Save batch if we've collected enough new posts
+                if collected_count >= last_save_count + batch_size:
+                    if hasattr(self, '_worker_filepaths'):
+                        # Parallel worker saves incremental batches
+                        new_posts_slice = posts_data[last_save_count:collected_count]
+                        await self._save_feed_batch(
+                            feed_uri, new_posts_slice, feed_participants, cursor,
+                            feed_filepath, temp_filepath, collected_count
+                        )
+                    else:
+                        # Single-threaded saves the entire accumulated data to the temp file
+                        await self._save_feed_batch(
+                            feed_uri, posts_data, feed_participants, cursor,
+                            feed_filepath, temp_filepath, collected_count
+                        )
+                    last_save_count = collected_count - (collected_count % batch_size)
+                    
+                    # Update discovered users for this batch
+                    if batch_participants:
+                        participant_handles = set(batch_participants.keys())
+                        await self._update_discovered_users(participant_handles)
+                        logger.info(f"Added {len(participant_handles)} new participants to discovered users")
+                
+                if not cursor:
+                    logger.info("No more pages to fetch.")
+                    break
+                logger.info(f"Collected {collected_count} unique posts so far from feed '{feed_uri}'")
+
+            # Final save
+            await self._save_feed_batch(
+                feed_uri, posts_data, feed_participants, None,
+                feed_filepath, temp_filepath, collected_count, is_final=True
+            )
+            
+            # Final update of discovered users
+            if feed_participants:
+                participant_handles = set(feed_participants.keys())
+                await self._update_discovered_users(participant_handles)
+                logger.info(f"Final update: Added {len(participant_handles)} participants to discovered users")
+            
+            # Clean up temp file
+            if temp_filepath.exists():
+                temp_filepath.unlink()
+            
+            logger.info(f"Successfully saved {len(posts_data)} posts and {len(feed_participants)} participants from feed '{feed_uri}'")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to collect content from feed '{feed_uri}': {e}", exc_info=True)
+            return False
+    
+    async def collect_all_feeds_content(self, feeds_limit: int = 50, posts_per_feed: int = 500) -> bool:
+        """Collect content from all suggested feeds"""
+        try:
+            logger.info(f"Starting comprehensive feed collection (feeds: {feeds_limit}, posts per feed: {posts_per_feed})")
+            
+            # First, collect suggested feeds
+            suggested_feeds = await self.collect_suggested_feeds(feeds_limit)
+            if not suggested_feeds:
+                logger.error("Failed to collect suggested feeds")
+                return False
+            
+            # Read the collected feeds
+            feeds_filepath = Path(FEEDS_DIR) / "suggested_feeds.json"
+            if not feeds_filepath.exists():
+                logger.error("Suggested feeds file not found")
+                return False
+            
+            with open(feeds_filepath, 'r', encoding='utf-8') as f:
+                feeds_data = json.load(f)
+            
+            # Collect content from each feed
+            successful_feeds = 0
+            total_feeds = len(feeds_data)
+            
+            for i, feed_data in enumerate(feeds_data, 1):
+                if isinstance(feed_data, dict):
+                    feed_uri = feed_data.get('uri')
+                    if feed_uri:
+                        logger.info(f"Processing feed {i}/{total_feeds}: {feed_uri}")
+                        success = await self.collect_feed_content(feed_uri, posts_per_feed)
+                        if success:
+                            successful_feeds += 1
+                        await asyncio.sleep(self.rate_limit_delay * 2)  # Extra delay between feeds
+            
+            logger.info(f"Feed collection completed: {successful_feeds}/{total_feeds} feeds processed successfully")
+            return successful_feeds > 0
+            
+        except Exception as e:
+            logger.error(f"Failed to collect all feeds content: {e}", exc_info=True)
+            return False
+    
+    def _load_existing_feed_data(self, feed_filepath: Path, temp_filepath: Path) -> dict:
+        """Load existing feed data for resume functionality."""
+        existing_data = {'posts': [], 'feed_participants': {}, 'cursor': None}
+        
+        # Try to load from temp file first (incomplete session)
+        if temp_filepath.exists():
+            try:
+                with open(temp_filepath, 'r', encoding='utf-8') as f:
+                    temp_data = json.load(f)
+                    existing_data['posts'] = temp_data.get('posts', [])
+                    existing_data['feed_participants'] = temp_data.get('feed_participants', {})
+                    existing_data['cursor'] = temp_data.get('cursor')
+                    logger.info(f"Resumed feed from temp file: {len(existing_data['posts'])} posts")
+                    return existing_data
+            except Exception as e:
+                logger.warning(f"Failed to load feed temp file: {e}")
+        
+        # Try to load from final file
+        if feed_filepath.exists():
+            try:
+                with open(feed_filepath, 'r', encoding='utf-8') as f:
+                    final_data = json.load(f)
+                    existing_data['posts'] = final_data.get('posts', [])
+                    existing_data['feed_participants'] = final_data.get('feed_participants', {})
+                    logger.info(f"Resumed feed from final file: {len(existing_data['posts'])} posts")
+                    return existing_data
+            except Exception as e:
+                logger.warning(f"Failed to load feed final file: {e}")
+        
+        return existing_data
+
+    async def _save_feed_batch(self, feed_uri: str, posts_data: list, feed_participants: dict,
+                              cursor: Optional[str], feed_filepath: Path, temp_filepath: Path,
+                              collected_count: int, is_final: bool = False):
+        """Save feed results in batches."""
+        try:
+            result_data = {
+                "feed_metadata": {
+                    "feed_uri": feed_uri,
+                    "total_results": len(posts_data),
+                    "collected_at": self._get_current_time(),
+                    "batch_saved": True,
+                    "is_final": is_final
+                },
+                "posts": posts_data,
+                "feed_participants": list(feed_participants.values()),
+                "cursor": cursor  # Save cursor for resume
+            }
+            
+            # Save to temp file during collection, final file when complete
+            save_path = feed_filepath if is_final else temp_filepath
+            self.saver.save_json(result_data, save_path)
+            
+            if is_final:
+                logger.info(f"Final feed save: {len(posts_data)} posts saved to {feed_filepath}")
+            else:
+                logger.info(f"Feed batch save: {len(posts_data)} posts saved to temp file (cursor: {cursor})")
+                
+        except Exception as e:
+            logger.error(f"Failed to save feed batch: {e}")
+            raise
+
+    def _load_existing_user_data(self, user_filepath: Path, temp_filepath: Path) -> dict:
+        """Load existing user data for resume functionality."""
+        # Check if this is a parallel worker by checking the temp file name pattern
+        is_parallel_worker = '_worker_' in temp_filepath.stem and temp_filepath.stem.endswith('_temp')
+
+        if is_parallel_worker:
+            worker_stem = temp_filepath.stem.replace('_temp', '')
+            batch_pattern = f"{worker_stem}_batch_*.json"
+            batch_files = sorted(
+                list(temp_filepath.parent.glob(batch_pattern)),
+                key=lambda x: int(x.stem.split('_batch_')[-1])
+            )
+            
+            if batch_files:
+                logger.info(f"Found {len(batch_files)} existing batch files for user worker. Resuming...")
+                all_posts = []
+                last_cursor = None
+                for batch_file in batch_files:
+                    try:
+                        with open(batch_file, 'r', encoding='utf-8') as f:
+                            batch_data = json.load(f)
+                        
+                        posts = batch_data.get('posts', [])
+                        all_posts.extend(posts)
+                        
+                        cursor_in_batch = batch_data.get('cursor')
+                        if cursor_in_batch:
+                            last_cursor = cursor_in_batch
+                    except Exception as e:
+                        logger.warning(f"Could not load or process user batch file {batch_file}: {e}")
+                
+                logger.info(f"Resumed with {len(all_posts)} posts for user worker.")
+                return {
+                    'posts': all_posts,
+                    'cursor': last_cursor
+                }
+
+        # Original logic for single-threaded or if no batch files are found
+        existing_data = {'posts': [], 'cursor': None}
+        
+        # Try to load from temp file first (incomplete session)
+        if temp_filepath.exists() and not is_parallel_worker:
+            try:
+                with open(temp_filepath, 'r', encoding='utf-8') as f:
+                    temp_data = json.load(f)
+                    existing_data['posts'] = temp_data.get('posts', [])
+                    existing_data['cursor'] = temp_data.get('cursor')
+                    logger.info(f"Resumed user from temp file: {len(existing_data['posts'])} posts")
+                    return existing_data
+            except Exception as e:
+                logger.warning(f"Failed to load user temp file: {e}")
+        
+        # Try to load from final file
+        if user_filepath.exists():
+            try:
+                with open(user_filepath, 'r', encoding='utf-8') as f:
+                    final_data = json.load(f)
+                    existing_data['posts'] = final_data.get('posts', [])
+                    logger.info(f"Resumed user from final file: {len(existing_data['posts'])} posts")
+                    return existing_data
+            except Exception as e:
+                logger.warning(f"Failed to load user final file: {e}")
+        
+        return existing_data
+
+    async def _save_user_batch(self, handle: str, posts_data: list, cursor: Optional[str],
+                              user_filepath: Path, temp_filepath: Path, collected_count: int, 
+                              is_final: bool = False):
+        """Save user posts in batches."""
+        try:
+            # For parallel collection, we need to save individual batches
+            if hasattr(self, '_worker_filepaths'):
+                # This is a parallel collection worker
+                worker_id = self._worker_filepaths.get('worker_id', 0)
+                
+                # Calculate batch number based on total collected count
+                batch_number = (collected_count // 100) + 1
+                batch_temp_filepath = temp_filepath.parent / f"{temp_filepath.stem}_batch_{batch_number}.json"
+                
+                # For incremental saving, `posts_data` is already the slice of new posts
+                batch_posts = posts_data
+                
+                batch_result = {
+                    "batch_metadata": {
+                        "handle": handle,
+                        "batch_number": batch_number,
+                        "worker_id": worker_id,
+                        "posts_in_batch": len(batch_posts),
+                        "collected_at": self._get_current_time(),
+                        "is_final": is_final
+                    },
+                    "posts": batch_posts,
+                    "cursor": cursor
+                }
+                
+                self.saver.save_json(batch_result, batch_temp_filepath)
+                logger.info(f"Worker {worker_id} Batch {batch_number}: Saved {len(batch_posts)} new posts to {batch_temp_filepath}")
+                
+                # If this is the final save, merge all batches for this worker
+                if is_final:
+                    await self._merge_user_worker_batches(handle, user_filepath, temp_filepath, worker_id)
+                
+            else:
+                # Single-threaded collection - save all accumulated data
+                result_data = {
+                    "user_metadata": {
+                        "handle": handle,
+                        "total_results": len(posts_data),
+                        "collected_at": self._get_current_time(),
+                        "batch_saved": True,
+                        "is_final": is_final
+                    },
+                    "posts": posts_data,
+                    "cursor": cursor  # Save cursor for resume
+                }
+                
+                # Save to temp file during collection, final file when complete
+                save_path = user_filepath if is_final else temp_filepath
+                self.saver.save_json(result_data, save_path)
+                
+                if is_final:
+                    logger.info(f"Final user save: {len(posts_data)} posts saved to {user_filepath}")
+                else:
+                    logger.info(f"User batch save: {len(posts_data)} posts saved to temp file (cursor: {cursor})")
+                
+        except Exception as e:
+            logger.error(f"Failed to save user batch: {e}")
+            raise
+
+    async def _process_post_view_for_feed(self, post_view: dict, feed_uri: str) -> Optional[dict]:
+        """Process a single post for feed collection"""
+        # Reuse existing processing logic, but use special marker for feed collection
+        processed_post = await self._process_post_view(post_view, "FEED_COLLECTION")
+        if not processed_post:
+            return None
+            
+        # Add feed-specific fields
+        processed_post['source_feed'] = feed_uri
+        return processed_post
+
+    def collect_all_discovered_users(self, collect_profiles: bool = True, collect_posts: bool = True, skip_existing: bool = True) -> bool:
+        """Collect profiles and/or posts for all discovered users"""
+        try:
+            # Read discovered users with file locking
+            discovered_users = self._safe_read_discovered_users()
+            if discovered_users is None:
+                logger.warning("No discovered users file found. Run keyword search or feed collection first.")
+                return False
+            
+            if not discovered_users:
+                logger.warning("No discovered users found.")
+                return False
+            
+            logger.info(f"Found {len(discovered_users)} discovered users")
+            
+            successful_profiles = 0
+            successful_posts = 0
+            skipped_profiles = 0
+            skipped_posts = 0
+            
+            for i, handle in enumerate(discovered_users, 1):
+                if not isinstance(handle, str):
+                    continue
+                
+                logger.info(f"Processing user {i}/{len(discovered_users)}: {handle}")
+                
+                # Check if files already exist
+                profile_file = Path(USER_PROFILES_DIR) / f"{handle.replace('.', '_')}_profile.json"
+                posts_file = Path(USER_POSTS_DIR) / f"{handle.replace('.', '_')}_posts.json"
+                
+                # Collect profile
+                if collect_profiles:
+                    if skip_existing and profile_file.exists():
+                        logger.info(f"Skipping profile for {handle} (already exists)")
+                        skipped_profiles += 1
+                    else:
+                        try:
+                            profile = self.client.get_user_profile(handle)
+                            if profile:
+                                self.saver.save_json(profile, profile_file)
+                                successful_profiles += 1
+                                logger.info(f"Successfully collected profile for {handle}")
+                            else:
+                                logger.warning(f"Failed to get profile for {handle}")
+                        except Exception as e:
+                            logger.error(f"Error collecting profile for {handle}: {e}")
+                
+                # Collect posts
+                if collect_posts:
+                    if skip_existing and posts_file.exists():
+                        logger.info(f"Skipping posts for {handle} (already exists)")
+                        skipped_posts += 1
+                    else:
+                        try:
+                            # Use a reasonable limit for batch collection
+                            limit = 1000  # Collect 1000 posts per user for batch processing
+                            success = asyncio.run(self.collect_user_posts(handle, limit))
+                            if success:
+                                successful_posts += 1
+                                logger.info(f"Successfully collected posts for {handle}")
+                            else:
+                                logger.warning(f"Failed to collect posts for {handle}")
+                        except Exception as e:
+                            logger.error(f"Error collecting posts for {handle}: {e}")
+                
+                # Rate limiting between users
+                import time
+                time.sleep(self.rate_limit_delay)
+            
+            # Summary
+            logger.info(f"Batch collection completed:")
+            if collect_profiles:
+                logger.info(f"  Profiles: {successful_profiles} collected, {skipped_profiles} skipped")
+            if collect_posts:
+                logger.info(f"  Posts: {successful_posts} collected, {skipped_posts} skipped")
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to collect discovered users: {e}", exc_info=True)
+            return False
+
+
+
 async def main():
     """Main function to handle command line arguments and execute data collection"""
     parser = argparse.ArgumentParser(description="Bluesky Comprehensive Data Collection Tool")
@@ -808,9 +1791,29 @@ async def main():
     parser.add_argument('--user-profile', action='store_true', help='Collect only user profile')
     parser.add_argument('--user-posts', action='store_true', help='Collect only user posts')
     parser.add_argument('--user-all', action='store_true', help='Collect both user profile and posts')
-    parser.add_argument('--popular', action='store_true', help='Collect popular content')
-    parser.add_argument('--suggested', action='store_true', help='Collect suggested users')
+
     parser.add_argument('--limit', type=int, help='Maximum number of items to collect (0 for unlimited)')
+    
+    # Feed discovery and collection
+    parser.add_argument('--feeds', action='store_true', help='Collect suggested feeds')
+    parser.add_argument('--feed', help='Collect content from a specific feed URI')
+    parser.add_argument('--all-feeds', action='store_true', help='Collect content from all suggested feeds')
+    parser.add_argument('--feeds-limit', type=int, default=50, help='Maximum number of feeds to collect (default: 50)')
+    parser.add_argument('--posts-per-feed', type=int, default=500, help='Maximum posts per feed (default: 500)')
+    
+    # Batch processing discovered users
+    parser.add_argument('--batch-profiles', action='store_true', help='Collect profiles for all discovered users')
+    parser.add_argument('--batch-posts', action='store_true', help='Collect posts for all discovered users')
+    parser.add_argument('--batch-all', action='store_true', help='Collect both profiles and posts for all discovered users')
+    parser.add_argument('--skip-existing', action='store_true', help='Skip users whose data already exists')
+    
+    # Parallel collection (new)
+    parser.add_argument('--parallel', action='store_true', help='Use parallel collection with multiple accounts')
+    parser.add_argument('--parallel-keyword', help='Search for posts containing this keyword using parallel collection')
+    parser.add_argument('--parallel-keywords', help='Comma-separated list of keywords to search using parallel collection')
+    parser.add_argument('--parallel-user', help='User handle to collect using parallel collection')
+    parser.add_argument('--parallel-batch-all', action='store_true', help='Batch process all discovered users using parallel collection')
+    parser.add_argument('--show-accounts', action='store_true', help='Show configured accounts for parallel collection')
     
     # Keyword search filters
     parser.add_argument('--author', help='Filter by author handle')
@@ -825,6 +1828,27 @@ async def main():
     
     args = parser.parse_args()
     
+    # Show account information if requested
+    if args.show_accounts:
+        parallel_collector = ParallelCollector()
+        account_info = parallel_collector.get_account_info()
+        print("\n=== Parallel Collection Account Configuration ===")
+        print(f"Total accounts: {account_info['total_accounts']}")
+        print(f"Parallel workers: {account_info['parallel_workers']}")
+        print(f"Time division strategy: {account_info['time_division_strategy']}")
+        if account_info['time_division_strategy'] == 'overlap':
+            print(f"Time overlap percent: {account_info['time_overlap_percent']}%")
+        print("\nAccounts:")
+        for acc in account_info['accounts']:
+            print(f"  Worker {acc['worker_id']}: {acc['username']} {'(with app password)' if acc['has_app_password'] else ''}")
+        return
+    
+    # Handle parallel collection
+    if args.parallel or args.parallel_keyword or args.parallel_keywords or args.parallel_user or args.parallel_batch_all:
+        await handle_parallel_collection(args)
+        return
+    
+    # Handle regular collection
     collector = BlueskyDataCollector()
     
     if not collector.authenticate():
@@ -857,13 +1881,19 @@ async def main():
         if not (args.user_profile or args.user_posts or args.user_all):
              logger.info("For --user, please specify --user-profile, --user-posts, or --user-all.")
 
-    if args.popular:
-        limit = args.limit or DEFAULT_POPULAR_LIMIT
-        tasks.append(asyncio.to_thread(collector.collect_popular_content, limit))
+    if args.feeds:
+        tasks.append(collector.collect_suggested_feeds(args.feeds_limit))
     
-    if args.suggested:
-        limit = args.limit or DEFAULT_SUGGESTED_LIMIT
-        tasks.append(asyncio.to_thread(collector.collect_suggested_users, limit))
+    if args.feed:
+        tasks.append(collector.collect_feed_content(args.feed, args.posts_per_feed))
+    
+    if args.all_feeds:
+        tasks.append(collector.collect_all_feeds_content(args.feeds_limit, args.posts_per_feed))
+    
+    if args.batch_profiles or args.batch_posts or args.batch_all:
+        collect_profiles = args.batch_profiles or args.batch_all
+        collect_posts = args.batch_posts or args.batch_all
+        tasks.append(asyncio.to_thread(collector.collect_all_discovered_users, collect_profiles, collect_posts, args.skip_existing))
     
     if not tasks:
         logger.info("No collection operations specified. Use --help for usage information.")
@@ -883,6 +1913,91 @@ async def main():
         logger.info(f"All {total_ops} data collection operations completed successfully!")
     else:
         logger.error(f"Some data collection operations failed ({successful_ops}/{total_ops} successful)")
+
+async def handle_parallel_collection(args):
+    """Handle parallel collection operations"""
+    parallel_collector = ParallelCollector()
+    
+    # Check if accounts are configured
+    account_info = parallel_collector.get_account_info()
+    if account_info['total_accounts'] == 0:
+        logger.error("No accounts configured for parallel collection. Please set up multi-account configuration in config.env")
+        return
+    
+    logger.info(f"Starting parallel collection with {account_info['total_accounts']} accounts")
+    
+    tasks = []
+    
+    # Parallel keyword search
+    if args.parallel_keyword:
+        limit = args.limit if args.limit is not None else DEFAULT_KEYWORD_LIMIT
+        filters = {
+            'author': args.author, 'domain': args.domain, 'lang': args.lang,
+            'mentions': args.mentions, 'tag': args.tag, 'url': args.url,
+            'since': args.since, 'until': args.until, 'sort': args.sort
+        }
+        # Remove None values
+        filters = {k: v for k, v in filters.items() if v is not None}
+        
+        result = await parallel_collector.collect_keyword_parallel(args.parallel_keyword, limit, **filters)
+        print_parallel_result("Parallel Keyword Search", result)
+    
+    # Parallel keywords search
+    if args.parallel_keywords:
+        limit = args.limit if args.limit is not None else DEFAULT_KEYWORD_LIMIT
+        keywords = [k.strip() for k in args.parallel_keywords.split(',')]
+        filters = {
+            'author': args.author, 'domain': args.domain, 'lang': args.lang,
+            'mentions': args.mentions, 'tag': args.tag, 'url': args.url,
+            'since': args.since, 'until': args.until, 'sort': args.sort
+        }
+        # Remove None values
+        filters = {k: v for k, v in filters.items() if v is not None}
+        
+        for keyword in keywords:
+            result = await parallel_collector.collect_keyword_parallel(keyword, limit, **filters)
+            print_parallel_result(f"Parallel Keywords Search: {keyword}", result)
+    
+    # Parallel user posts collection
+    if args.parallel_user:
+        limit = args.limit if args.limit is not None else DEFAULT_USER_POSTS_LIMIT
+        result = await parallel_collector.collect_user_posts_parallel(args.parallel_user, limit)
+        print_parallel_result("Parallel User Posts Collection", result)
+    
+    # Parallel batch processing
+    if args.parallel_batch_all:
+        result = await parallel_collector.collect_batch_parallel(args.skip_existing)
+        print_parallel_result("Parallel Batch Processing", result)
+
+def print_parallel_result(operation_name: str, result: Dict[str, Any]):
+    """Print parallel collection results in a formatted way"""
+    print(f"\n=== {operation_name} Results ===")
+    print(f"Success: {result.get('success', False)}")
+    print(f"Successful workers: {result.get('successful_workers', 0)}/{result.get('total_workers', 0)}")
+    
+    if 'total_collected' in result:
+        print(f"Total collected: {result.get('total_collected', 0)}")
+    
+    if 'total_profiles_collected' in result:
+        print(f"Total profiles collected: {result.get('total_profiles_collected', 0)}")
+    
+    if 'total_posts_collected' in result:
+        print(f"Total posts collected: {result.get('total_posts_collected', 0)}")
+    
+    if 'time_windows' in result and result['time_windows']:
+        print("\nTime Windows:")
+        for window in result['time_windows']:
+            print(f"  Worker {window['worker_id']}: {window['start_time']} to {window['end_time']}")
+    
+    if 'user_distribution' in result and result['user_distribution']:
+        print("\nUser Distribution:")
+        for dist in result['user_distribution']:
+            print(f"  Worker {dist['worker_id']}: {dist['users_assigned']} users assigned")
+    
+    if 'errors' in result and result['errors']:
+        print("\nErrors:")
+        for error in result['errors']:
+            print(f"  {error}")
 
 if __name__ == "__main__":
     asyncio.run(main())

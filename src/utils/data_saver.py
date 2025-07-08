@@ -27,7 +27,11 @@ class DataSaver:
             logger.error(f"Error saving data to {filepath}: {e}")
 
     def save_discovered_users(self, users: Set[str], filepath: Path):
-        """Reads, updates, and writes the central list of discovered users."""
+        """Reads, updates, and writes the central list of discovered users.
+        
+        Note: This method is deprecated in favor of the atomic version in the main collector.
+        The atomic version provides better concurrency handling.
+        """
         if not users:
             return
 

@@ -52,8 +52,8 @@ python main.py --keyword "python" --limit 100
 
 1. **Clone the repository**
 ```bash
-git clone <repository-url>
-cd Bluesky
+git clone https://github.com/kydchen/bluesky-data-collector.git
+cd bluesky-data-collector
 ```
 
 2. **Create virtual environment**
